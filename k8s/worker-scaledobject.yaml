@@ -1,0 +1,23 @@
+# Scales the workers on the number of tiles waiting in the NATS consumer.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: render-worker
+  namespace: render
+spec:
+  scaleTargetRef:
+    name: render-worker
+  minReplicaCount: 0
+  maxReplicaCount: 8
+  pollingInterval: 5
+  cooldownPeriod: 60
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: nats.nats.svc.cluster.local:8222
+        account: $G
+        stream: TILES
+        consumer: workers
+        # Target pending tiles per worker.
+        lagThreshold: "20"
+        activationLagThreshold: "0"

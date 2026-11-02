@@ -7,5 +7,11 @@ config:
   monitor:
     enabled: true
 
+# KEDA's nats-jetstream scaler reads /jsz through the service.
+service:
+  ports:
+    monitor:
+      enabled: true
+
 natsBox:
   enabled: true
