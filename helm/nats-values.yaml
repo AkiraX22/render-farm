@@ -15,3 +15,8 @@ service:
 
 natsBox:
   enabled: true
+
+promExporter:
+  enabled: true
+  podMonitor:
+    enabled: true

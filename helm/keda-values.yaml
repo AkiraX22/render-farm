@@ -1,0 +1,9 @@
+prometheus:
+  operator:
+    enabled: true
+    podMonitor:
+      enabled: true
+  metricServer:
+    enabled: true
+    podMonitor:
+      enabled: true

@@ -1,0 +1,30 @@
+# kube-prometheus-stack, trimmed down for a local kind cluster.
+alertmanager:
+  enabled: false
+
+# Control-plane components are not reachable from Prometheus on kind.
+kubeEtcd:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    # Pick up PodMonitors/ServiceMonitors from every release and namespace.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeInterval: 5s
+    retention: 2d
+
+grafana:
+  adminPassword: render-farm
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      searchNamespace: ALL

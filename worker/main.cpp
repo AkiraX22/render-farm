@@ -1,3 +1,4 @@
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -5,8 +6,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
 
@@ -19,6 +24,71 @@ using json = nlohmann::json;
 std::atomic<bool> running{true};
 
 void handle_sigterm(int) { running = false; }
+
+// Prometheus metrics, exposed in text format on METRICS_PORT.
+constexpr std::array<double, 7> kBuckets{0.005, 0.01, 0.05, 0.1, 0.5, 1, 5};
+std::array<std::atomic<uint64_t>, kBuckets.size()> tile_seconds_buckets{};
+std::atomic<uint64_t> tile_seconds_count{0};
+std::atomic<double> tile_seconds_sum{0};
+std::atomic<uint64_t> tiles_failed{0};
+std::atomic<uint64_t> pixels_rendered{0};
+
+void observe_tile(double seconds, uint64_t pixels) {
+    for (size_t i = 0; i < kBuckets.size(); ++i)
+        if (seconds <= kBuckets[i]) ++tile_seconds_buckets[i];
+    ++tile_seconds_count;
+    tile_seconds_sum += seconds;
+    pixels_rendered += pixels;
+}
+
+std::string render_metrics() {
+    std::ostringstream out;
+    out << "# HELP render_tile_seconds Time to render and upload one tile.\n"
+        << "# TYPE render_tile_seconds histogram\n";
+    for (size_t i = 0; i < kBuckets.size(); ++i)
+        out << "render_tile_seconds_bucket{le=\"" << kBuckets[i] << "\"} " << tile_seconds_buckets[i] << "\n";
+    out << "render_tile_seconds_bucket{le=\"+Inf\"} " << tile_seconds_count << "\n"
+        << "render_tile_seconds_sum " << tile_seconds_sum << "\n"
+        << "render_tile_seconds_count " << tile_seconds_count << "\n"
+        << "# HELP render_tiles_failed_total Tiles that could not be rendered or stored.\n"
+        << "# TYPE render_tiles_failed_total counter\n"
+        << "render_tiles_failed_total " << tiles_failed << "\n"
+        << "# HELP render_pixels_total Pixels rendered.\n"
+        << "# TYPE render_pixels_total counter\n"
+        << "render_pixels_total " << pixels_rendered << "\n";
+    return out.str();
+}
+
+// Minimal HTTP server: answers every request with the metrics page.
+void serve_metrics(int port) {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    const int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(fd, 16) != 0) {
+        std::cerr << "metrics: cannot listen on port " << port << std::endl;
+        close(fd);
+        return;
+    }
+    while (running) {
+        pollfd pfd{fd, POLLIN, 0};
+        if (poll(&pfd, 1, 500) <= 0) continue;
+        const int client = accept(fd, nullptr, nullptr);
+        if (client < 0) continue;
+        char buf[1024];
+        recv(client, buf, sizeof(buf), 0);
+        const std::string body = render_metrics();
+        const std::string resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\n"
+                                 "Content-Length: " + std::to_string(body.size()) +
+                                 "\r\nConnection: close\r\n\r\n" + body;
+        send(client, resp.data(), resp.size(), MSG_NOSIGNAL);
+        close(client);
+    }
+    close(fd);
+}
 
 std::string env_or(const char* name, const char* fallback) {
     const char* value = std::getenv(name);
@@ -126,6 +196,7 @@ int main() {
                 env_or("MINIO_ROOT_USER", "") + ":" + env_or("MINIO_ROOT_PASSWORD", "")};
     std::cout << "Worker started: " << host << " nats=" << nats_url << " s3=" << s3.endpoint << std::endl;
     curl_global_init(CURL_GLOBAL_DEFAULT);
+    std::thread metrics(serve_metrics, std::stoi(env_or("METRICS_PORT", "9100")));
 
     natsOptions* opts = nullptr;
     natsConnection* conn = nullptr;
@@ -168,21 +239,25 @@ int main() {
                 const auto rgb = render_tile(t);
                 if (!upload_tile(s3, t, rgb)) {
                     // Redeliver later, possibly to another worker.
+                    ++tiles_failed;
                     natsMsg_NakWithDelay(msg, 5000, nullptr);
                     continue;
                 }
                 const std::chrono::duration<double> took = std::chrono::steady_clock::now() - start;
                 natsMsg_Ack(msg, nullptr);
+                observe_tile(took.count(), static_cast<uint64_t>(t.w) * t.h);
                 std::cout << host << " job=" << t.job << " tile=" << t.x << "," << t.y
                           << " seconds=" << took.count() << " total=" << ++tiles << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << host << " bad tile: " << e.what() << std::endl;
+                ++tiles_failed;
                 natsMsg_Term(msg, nullptr);
             }
         }
         natsMsgList_Destroy(&list);
     }
 
+    metrics.join();
     natsSubscription_Destroy(sub);
     jsCtx_Destroy(js);
     natsConnection_Destroy(conn);

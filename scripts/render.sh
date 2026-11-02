@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 JOB="${JOB:-job-$(date +%H%M%S)}"
-CONTROLLER_IMAGE="${CONTROLLER_IMAGE:-render-controller:0.3.0}"
+CONTROLLER_IMAGE="${CONTROLLER_IMAGE:-render-controller:0.4.0}"
 ARGS=$(printf '"%s", ' render --job "$JOB" "$@")
 
 kubectl apply -f - <<YAML
@@ -30,9 +30,21 @@ spec:
                 name: minio-credentials
 YAML
 
-kubectl -n render wait --for=condition=ready pod -l job-name="render-$JOB" --timeout=60s >/dev/null
-kubectl -n render logs -f "job/render-$JOB"
-kubectl -n render wait --for=condition=complete "job/render-$JOB" --timeout=30s >/dev/null
+job_state() {
+    kubectl -n render get job "render-$JOB" -o jsonpath='{.status.conditions[?(@.status=="True")].type}'
+}
+
+# Poll the progress line instead of `logs -f`, which needs an inotify instance on the
+# node and often runs out of them on kind.
+until [[ $(job_state) =~ Complete|Failed ]]; do
+    kubectl -n render logs "job/render-$JOB" --tail=1 2>/dev/null || true
+    sleep 3
+done
+kubectl -n render logs "job/render-$JOB" --tail=2
+if [[ $(job_state) =~ Failed ]]; then
+    echo "job render-$JOB failed" >&2
+    exit 1
+fi
 
 # Download the result through a temporary port-forward, signing the request with SigV4.
 USER=$(kubectl -n minio get secret minio-credentials -o jsonpath='{.data.MINIO_ROOT_USER}' | base64 -d)
