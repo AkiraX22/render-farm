@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include <curl/curl.h>
 #include <nats/nats.h>
 #include <nlohmann/json.hpp>
 
@@ -70,6 +71,43 @@ std::vector<uint8_t> render_tile(const Tile& t) {
     return rgb;
 }
 
+struct S3 {
+    std::string endpoint, bucket, userpwd;
+};
+
+size_t discard(char*, size_t size, size_t n, void*) { return size * n; }
+
+// PUTs the tile as a PPM image, signed with AWS SigV4 so MinIO accepts it.
+bool upload_tile(const S3& s3, const Tile& t, const std::vector<uint8_t>& rgb) {
+    std::string body = "P6\n" + std::to_string(t.w) + " " + std::to_string(t.h) + "\n255\n";
+    body.append(rgb.begin(), rgb.end());
+    const std::string url = s3.endpoint + "/" + s3.bucket + "/jobs/" + t.job + "/tiles/" +
+                            std::to_string(t.x) + "_" + std::to_string(t.y) + ".ppm";
+
+    CURL* curl = curl_easy_init();
+    curl_slist* headers = curl_slist_append(nullptr, "Content-Type: image/x-portable-pixmap");
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, "aws:amz:us-east-1:s3");
+    curl_easy_setopt(curl, CURLOPT_USERPWD, s3.userpwd.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    const CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    if (res != CURLE_OK || code != 200) {
+        std::cerr << "upload " << url << " failed: " << curl_easy_strerror(res) << " http=" << code << std::endl;
+        return false;
+    }
+    return true;
+}
+
 bool check(natsStatus s, const char* what) {
     if (s == NATS_OK) return true;
     std::cerr << what << " failed: " << natsStatus_GetText(s) << std::endl;
@@ -83,7 +121,11 @@ int main() {
     char host[256] = "unknown";
     gethostname(host, sizeof(host));
     const std::string nats_url = env_or("NATS_URL", "nats://nats.nats.svc.cluster.local:4222");
-    std::cout << "Worker started: " << host << " nats=" << nats_url << std::endl;
+    const S3 s3{env_or("MINIO_ENDPOINT", "http://minio.minio.svc.cluster.local:9000"),
+                env_or("MINIO_BUCKET", "renders"),
+                env_or("MINIO_ROOT_USER", "") + ":" + env_or("MINIO_ROOT_PASSWORD", "")};
+    std::cout << "Worker started: " << host << " nats=" << nats_url << " s3=" << s3.endpoint << std::endl;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
     natsOptions* opts = nullptr;
     natsConnection* conn = nullptr;
@@ -124,6 +166,11 @@ int main() {
                 const Tile t = parse_tile(natsMsg_GetData(msg), natsMsg_GetDataLength(msg));
                 const auto start = std::chrono::steady_clock::now();
                 const auto rgb = render_tile(t);
+                if (!upload_tile(s3, t, rgb)) {
+                    // Redeliver later, possibly to another worker.
+                    natsMsg_NakWithDelay(msg, 5000, nullptr);
+                    continue;
+                }
                 const std::chrono::duration<double> took = std::chrono::steady_clock::now() - start;
                 natsMsg_Ack(msg, nullptr);
                 std::cout << host << " job=" << t.job << " tile=" << t.x << "," << t.y
@@ -140,5 +187,6 @@ int main() {
     jsCtx_Destroy(js);
     natsConnection_Destroy(conn);
     natsOptions_Destroy(opts);
+    curl_global_cleanup();
     std::cout << host << " stopped cleanly after " << tiles << " tiles" << std::endl;
 }

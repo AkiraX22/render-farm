@@ -11,6 +11,9 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: setup
-          image: render-controller:0.2.0
+          image: render-controller:0.3.0
           imagePullPolicy: IfNotPresent
           args: ["setup"]
+          envFrom:
+            - secretRef:
+                name: minio-credentials

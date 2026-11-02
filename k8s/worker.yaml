@@ -23,11 +23,16 @@ spec:
         runAsUser: 65532
       containers:
         - name: worker
-          image: render-worker:0.2.0
+          image: render-worker:0.3.0
           imagePullPolicy: IfNotPresent
           env:
             - name: NATS_URL
               value: nats://nats.nats.svc.cluster.local:4222
+            - name: MINIO_ENDPOINT
+              value: http://minio.minio.svc.cluster.local:9000
+          envFrom:
+            - secretRef:
+                name: minio-credentials
           resources:
             requests:
               cpu: 100m

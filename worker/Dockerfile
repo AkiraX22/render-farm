@@ -1,6 +1,6 @@
 FROM debian:trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        g++ cmake make curl ca-certificates nlohmann-json3-dev \
+        g++ cmake make curl ca-certificates nlohmann-json3-dev libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # NATS C client, built as a static library without TLS (cluster-internal traffic).
@@ -14,8 +14,11 @@ RUN curl -fsSL https://github.com/nats-io/nats.c/archive/refs/tags/v${NATS_C_VER
 
 WORKDIR /src
 COPY main.cpp .
-RUN g++ -O2 -std=c++20 -static -o worker main.cpp -lnats_static -lpthread
+RUN g++ -O2 -std=c++20 -o worker main.cpp -lnats_static -lcurl -lpthread
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libcurl4t64 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/worker /worker
+USER 65532
 ENTRYPOINT ["/worker"]
